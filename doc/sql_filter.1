@@ -1,0 +1,188 @@
+.TH SQL_FILTER 1 "September 2026" "sql-sanitizer" "User Commands"
+.SH NAME
+sql_filter - ultra-fast, zero-ORM, injection-safe text-to-SQLite stream filter
+.SH SYNOPSIS
+.B sql_filter
+\[\\fB-t\\fR \\fIname\\fR | \\fB--table\\fR=\\fIname\\fR\]
+\[\\fB-c\\fR \\fIcategory\\fR | \\fB--category\\fR=\\fIcategory\\fR\]
+\[\\fB-l\\fR \\fIlang\\fR | \\fB--lang\\fR=\\fIlang\\fR\]
+\[\\fB-b\\fR \\fIsize\\fR | \\fB--batch\\fR=\\fIsize\\fR\]
+\[\\fB-w\\fR | \\fB--whole\\fR\]
+\[\\fB--col-doc_id\\fR=\\fIname\\fR | \\fB--col-doc-id\\fR=\\fIname\\fR\]
+\[\\fB--col-lang\\fR=\\fIname\\fR\]
+\[\\fB--col-category\\fR=\\fIname\\fR\]
+\[\\fB--col-raw_text\\fR=\\fIname\\fR | \\fB--col-raw-text\\fR=\\fIname\\fR\]
+\[\\fB--col-created_at\\fR=\\fIname\\fR | \\fB--col-created-at\\fR=\\fIname\\fR\]
+\[\\fB--no-doc_id\\fR | \\fB--no-doc-id\\fR\]
+\[\\fB--no-lang\\fR\]
+\[\\fB--no-category\\fR\]
+\[\\fB--no-raw_text\\fR | \\fB--no-raw-text\\fR\]
+\[\\fB--no-created_at\\fR | \\fB--no-created-at\\fR\]
+\[\\fB-h\\fR | \\fB--help\\fR\]
+.SH DESCRIPTION
+.B sql_filter
+is a high-performance streaming parser and sanitizer implemented in Bison and C99.
+It reads raw text streams or structured document blocks from standard input,
+strictly sanitizes untrusted inputs against SQL injection attacks, and emits optimized
+SQL transactional statements directly pipeable to the
+.BR sqlite3 (1)
+command-line interface.
+.PP
+By operating at the stream level without intermediate ORM layers, runtime garbage collection,
+or high-level language virtual machines (such as Python or Node.js),
+.B sql_filter
+enables piping massive logs, scraped corpora, and untrusted inputs directly into SQLite
+database files at native wire speed with sub-megabyte resident memory consumption.
+.PP
+The filter automatically outputs initial database schema declarations with
+Write-Ahead Logging (WAL) pragmas and bundles record insertions into automatic
+transactions to achieve maximum disk write throughput.
+
+.SH OPTIONS
+.SS General Options
+.TP
+\\fB-t\\fR, \\fB--table\\fR \\fIname\\fR
+Specify the destination SQLite table name. Defaults to
+.BR raw_corpus .
+.TP
+\\fB-c\\fR, \\fB--category\\fR \\fIcategory\\fR
+Set the default category attribute for records. Defaults to
+.BR general .
+.TP
+\\fB-l\\fR, \\fB--lang\\fR \\fIcode\\fR
+Set the default ISO language code attribute. Defaults to
+.BR ja .
+.TP
+\\fB-b\\fR, \\fB--batch\\fR \\fIsize\\fR
+Set the automatic transaction batch size (number of INSERT statements per BEGIN/COMMIT block). Defaults to
+.BR 1000 .
+.TP
+\\fB-w\\fR, \\fB--whole\\fR
+Whole-stream absorption mode. Ingests all standard input up to EOF as a single record rather than splitting line by line.
+.TP
+\\fB-h\\fR, \\fB--help\\fR
+Display command synopsis, list all available options, and exit.
+
+.SS Column Name Customization
+Both underscore and hyphen notations are accepted for option flags.
+.TP
+\\fB--col-doc_id\\fR \\fIname\\fR, \\fB--col-doc-id\\fR \\fIname\\fR
+Rename the identifier column. Defaults to
+.BR doc_id .
+.TP
+\\fB--col-lang\\fR \\fIname\\fR
+Rename the language code column. Defaults to
+.BR lang .
+.TP
+\\fB--col-category\\fR \\fIname\\fR
+Rename the domain category column. Defaults to
+.BR category .
+.TP
+\\fB--col-raw_text\\fR \\fIname\\fR, \\fB--col-raw-text\\fR \\fIname\\fR
+Rename the text content column. Defaults to
+.BR raw_text .
+.TP
+\\fB--col-created_at\\fR \\fIname\\fR, \\fB--col-created-at\\fR \\fIname\\fR
+Rename the timestamp column. Defaults to
+.BR created_at .
+
+.SS Column Omission Flags
+When specified, the column is completely omitted from both the generated
+.B CREATE TABLE
+schema definition and all emitted
+.B INSERT INTO
+statements.
+.TP
+\\fB--no-doc_id\\fR, \\fB--no-doc-id\\fR
+Omit the identifier column.
+.TP
+\\fB--no-lang\\fR
+Omit the language code column.
+.TP
+\\fB--no-category\\fR
+Omit the category column.
+.TP
+\\fB--no-raw_text\\fR, \\fB--no-raw-text\\fR
+Omit the raw text column.
+.TP
+\\fB--no-created_at\\fR, \\fB--no-created-at\\fR
+Omit the timestamp column.
+
+.SH INPUT MODES
+.B sql_filter
+transparently supports two distinct input styles without requiring explicit mode flags:
+
+.SS 1. Plain Stream Line Mode
+Every non-empty, non-whitespace line is ingested as an individual record.
+Default metadata configured via
+.BR -c ,
+.BR -l ,
+and internal defaults are attached to each line.
+
+.SS 2. Structured DSL Block Mode
+Enclosed document blocks allow assigning per-document identifiers, language codes, and categories:
+.PP
+.nf
+.RS
+Document(id: "doc_001", lang: "en", category: "audit_log") {
+Raw multi-line untrusted text goes here.
+Quotes like 'hello' and attack vectors like:
+'); DROP TABLE raw_corpus; --
+are safely escaped without syntax breakout.
+}
+.RE
+.fi
+
+.SH SECURITY MODEL
+.B sql_filter
+enforces mathematical immunity against SQL injection vulnerabilities:
+.IP 1. 4
+\\fBSingle-Quote Escaping\\fR: Every single-quote character (\\f(CW'\\fR) within input payloads is converted to SQLite's literal double-quote escape sequence (\\f(CW''\\fR).
+.IP 2. 4
+\\fBNUL Byte Elimination\\fR: ASCII NUL bytes (\\f(CW\\0\\fR) are dropped from the output stream to thwart C-string termination truncation exploits.
+.IP 3. 4
+\\fBControl Character Scrubbing\\fR: ASCII control codes below \\f(CW0x20\\fR (excluding newline \\f(CW\\n\\fR, carriage return \\f(CW\\r\\fR, and horizontal tab \\f(CW\\t\\fR) are replaced with benign spaces, preventing terminal injection and driver corruption.
+
+.SH EXAMPLES
+.SS Example 1: Direct pipe to SQLite database
+.PP
+.nf
+.RS
+echo "Hello, world's data!" | ./bin/sql_filter | sqlite3 corpus.db
+.RE
+.fi
+
+.SS Example 2: Column omission and custom column mapping
+.PP
+.nf
+.RS
+cat raw_log.txt | ./bin/sql_filter \\
+\--table custom_logs \\
+\--no-doc_id \\
+\--no-lang \\
+\--col-raw_text body \\
+\--col-created_at inserted_at | sqlite3 corpus.db
+.RE
+.fi
+
+.SS Example 3: Whole-stream absorption for large documents
+.PP
+.nf
+.RS
+./bin/sql_filter -w --table books --no-doc_id < war_and_peace.txt | sqlite3 library.db
+.RE
+.fi
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success. All input records parsed and valid SQL stream emitted.
+.TP
+.B 1
+Fatal error encountered (such as memory allocation failure or invalid command-line arguments).
+
+.SH SEE ALSO
+.BR sqlite3 (1),
+.BR bison (1),
+.BR groff (1),
+.BR man (1)
