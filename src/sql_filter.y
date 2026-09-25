@@ -1,5 +1,5 @@
 %{
-#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,10 +8,10 @@
 #include <getopt.h>
 
 extern int yylex(void);
-extern int yylineno;
+extern int yyparse(void);
 void yyerror(const char *s);
 
-/* SQL 出力用バッファ構造体 */
+// Dynamic string buffer for arbitrary length payloads
 typedef struct {
     char *data;
     size_t len;
@@ -28,14 +28,14 @@ static char g_default_doc_id[128] = "anon_doc";
 static char g_default_lang[32] = "ja";
 static char g_default_category[64] = "general";
 
-/* カラム名設定（変更可能） */
+// Configurable column names
 static char g_col_doc_id[64] = "doc_id";
 static char g_col_lang[64] = "lang";
 static char g_col_category[64] = "category";
 static char g_col_raw_text[64] = "raw_text";
 static char g_col_created_at[64] = "created_at";
 
-/* カラム出力有効フラグ */
+// Column inclusion flags (default all included)
 static bool g_has_doc_id = true;
 static bool g_has_lang = true;
 static bool g_has_category = true;
@@ -46,210 +46,256 @@ static long g_insert_count = 0;
 static long g_batch_size = 1000;
 static bool g_whole_mode = false;
 
-/* 文字列バッファ操作関数 */
 static void buf_init(StringBuffer *b) {
-    b->cap = 4096;
     b->len = 0;
-    b->data = malloc(b->cap);
+    b->cap = 256;
+    b->data = (char *)malloc(b->cap);
     if (!b->data) {
-        fprintf(stderr, "[-] Fatal: Out of memory\n");
+        fprintf(stderr, "Fatal: Out of memory\n");
         exit(1);
     }
     b->data[0] = '\0';
 }
 
-static void buf_reset(StringBuffer *b) {
-    b->len = 0;
-    if (b->data) {
-        b->data[0] = '\0';
-    }
-}
-
-static void buf_ensure(StringBuffer *b, size_t extra) {
-    if (b->len + extra + 1 > b->cap) {
-        while (b->len + extra + 1 > b->cap) {
-            b->cap *= 2;
-        }
-        b->data = realloc(b->data, b->cap);
+static void buf_append_char(StringBuffer *b, char c) {
+    if (b->len + 2 > b->cap) {
+        b->cap = (b->cap < 1024) ? b->cap * 2 : b->cap + 4096;
+        b->data = (char *)realloc(b->data, b->cap);
         if (!b->data) {
-            fprintf(stderr, "[-] Fatal: Out of memory in realloc\n");
+            fprintf(stderr, "Fatal: Out of memory\n");
             exit(1);
         }
     }
+    b->data[b->len++] = c;
+    b->data[b->len] = '\0';
 }
 
-/*
- * SQLite 用エスケープ処理:
- * 1. シングルクォート (') を 2連シングルクォート ('') に変換 (SQL Injection 物理根絶)
- * 2. NUL バイト (\0) はスキップ
- * 3. 制御コード (0x00-0x1F、ただし \t, \n, \r 以外) は安全なスペースに置換
- */
-static void buf_append_escaped_sql(StringBuffer *b, const char *src, size_t src_len) {
-    buf_ensure(b, src_len * 2 + 1);
-    char *dst = b->data + b->len;
+static void buf_free(StringBuffer *b) {
+    if (b->data) {
+        free(b->data);
+        b->data = NULL;
+    }
+    b->len = 0;
+    b->cap = 0;
+}
 
-    for (size_t i = 0; i < src_len; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '\0') {
-            continue;
-        } else if (c == '\'') {
-            *dst++ = '\'';
-            *dst++ = '\'';
-        } else if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
-            *dst++ = ' ';
-        } else {
-            *dst++ = (char)c;
+// Safely escape SQL string literal (' -> '') and sanitize binary/control characters
+static void print_escaped_literal(const char *src) {
+    putchar('\'');
+    if (src) {
+        for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+            if (*p == '\'') {
+                putchar('\'');
+                putchar('\'');
+            } else if (*p == '\0') {
+                continue;
+            } else if (*p < 0x20 && *p != '\n' && *p != '\r' && *p != '\t') {
+                putchar(' ');
+            } else {
+                putchar(*p);
+            }
         }
     }
-    *dst = '\0';
-    b->len = dst - b->data;
+    putchar('\'');
 }
 
-/* 安全な INSERT INTO 文の動的出力（有効なカラムのみ整形出力） */
-static void emit_sql_record(const char *doc_id, const char *lang, const char *category, const StringBuffer *text) {
-    if (text->len == 0 && !g_has_raw_text) return;
+// Clean and sanitize string copying into target buffer
+static void sanitize_string_copy(char *dst, const char *src, size_t max_len) {
+    if (!dst || max_len == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
 
-    if (g_insert_count % g_batch_size == 0) {
-        if (g_insert_count > 0) {
-            printf("COMMIT;\n");
+    size_t d_idx = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && d_idx + 1 < max_len; p++) {
+        if (*p == '\0') {
+            continue;
+        } else if (*p < 0x20 && *p != '\t') {
+            dst[d_idx++] = ' ';
+        } else {
+            dst[d_idx++] = (char)*p;
         }
+    }
+    dst[d_idx] = '\0';
+}
+
+// Validate identifier (table/column name)
+static bool is_valid_ident(const char *s) {
+    if (!s || !*s) return false;
+    for (const char *p = s; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reset document attributes back to defaults for subsequent records
+static void reset_doc_attrs(void) {
+    sanitize_string_copy(g_doc_id, g_default_doc_id, sizeof(g_doc_id));
+    sanitize_string_copy(g_lang, g_default_lang, sizeof(g_lang));
+    sanitize_string_copy(g_category, g_default_category, sizeof(g_category));
+}
+
+// Emit dynamic DDL schema header
+static void emit_schema_header(void) {
+    printf("-- Auto-generated by UBS sql_filter (Injection-Safe Pipeline)\n");
+    printf("PRAGMA journal_mode = WAL;\n");
+    printf("PRAGMA synchronous = NORMAL;\n");
+    printf("CREATE TABLE IF NOT EXISTS %s (\n", g_table_name);
+    printf("    id INTEGER PRIMARY KEY AUTOINCREMENT");
+
+    if (g_has_doc_id)     printf(",\n    %s TEXT", g_col_doc_id);
+    if (g_has_lang)       printf(",\n    %s TEXT", g_col_lang);
+    if (g_has_category)   printf(",\n    %s TEXT", g_col_category);
+    if (g_has_raw_text)   printf(",\n    %s TEXT", g_col_raw_text);
+    if (g_has_created_at) printf(",\n    %s DATETIME", g_col_created_at);
+
+    printf("\n);\n");
+}
+
+// Emit dynamic INSERT record
+static void emit_sql_record(const char *doc_id, const char *lang, const char *category, const char *raw_text) {
+    if (g_insert_count % g_batch_size == 0) {
         printf("BEGIN TRANSACTION;\n");
     }
 
     printf("INSERT INTO %s (", g_table_name);
-    bool first = true;
+    bool first_col = true;
     if (g_has_doc_id) {
-        printf("%s%s", first ? "" : ", ", g_col_doc_id);
-        first = false;
+        printf("%s%s", first_col ? "" : ", ", g_col_doc_id);
+        first_col = false;
     }
     if (g_has_lang) {
-        printf("%s%s", first ? "" : ", ", g_col_lang);
-        first = false;
+        printf("%s%s", first_col ? "" : ", ", g_col_lang);
+        first_col = false;
     }
     if (g_has_category) {
-        printf("%s%s", first ? "" : ", ", g_col_category);
-        first = false;
+        printf("%s%s", first_col ? "" : ", ", g_col_category);
+        first_col = false;
     }
     if (g_has_raw_text) {
-        printf("%s%s", first ? "" : ", ", g_col_raw_text);
-        first = false;
+        printf("%s%s", first_col ? "" : ", ", g_col_raw_text);
+        first_col = false;
     }
     if (g_has_created_at) {
-        printf("%s%s", first ? "" : ", ", g_col_created_at);
-        first = false;
+        printf("%s%s", first_col ? "" : ", ", g_col_created_at);
+        first_col = false;
     }
-
     printf(") VALUES (");
-    first = true;
+
+    bool first_val = true;
     if (g_has_doc_id) {
-        printf("%s'%s'", first ? "" : ", ", doc_id);
-        first = false;
+        if (!first_val) printf(", ");
+        print_escaped_literal(doc_id);
+        first_val = false;
     }
     if (g_has_lang) {
-        printf("%s'%s'", first ? "" : ", ", lang);
-        first = false;
+        if (!first_val) printf(", ");
+        print_escaped_literal(lang);
+        first_val = false;
     }
     if (g_has_category) {
-        printf("%s'%s'", first ? "" : ", ", category);
-        first = false;
+        if (!first_val) printf(", ");
+        print_escaped_literal(category);
+        first_val = false;
     }
     if (g_has_raw_text) {
-        printf("%s'%s'", first ? "" : ", ", text->data ? text->data : "");
-        first = false;
+        if (!first_val) printf(", ");
+        print_escaped_literal(raw_text);
+        first_val = false;
     }
     if (g_has_created_at) {
-        printf("%sdatetime('now')", first ? "" : ", ");
-        first = false;
+        if (!first_val) printf(", ");
+        printf("datetime('now')");
+        first_val = false;
     }
     printf(");\n");
 
     g_insert_count++;
+    if (g_insert_count % g_batch_size == 0) {
+        printf("COMMIT;\n");
+    }
 }
-
 %}
 
 %union {
     char *str;
 }
 
-%token TOK_DOCUMENT TOK_ID_KEY TOK_LANG_KEY TOK_CAT_KEY
-%token <str> STRING_LITERAL RAW_LINE
+%token TOK_DOCUMENT TOK_ID TOK_LANG TOK_CATEGORY
+%token <str> TOK_STRING_LITERAL TOK_RAW_TEXT TOK_RAW_LINE
+%type <str> doc_body
 
 %%
 
-corpus
-    : records
+input_stream
+    : document_list
     ;
 
-records
+document_list
     : /* empty */
-    | records record
+    | document_list item
     ;
 
-record
-    : document_block
-    | plain_stream_line
-    | error { yyerrok; }
-    ;
-
-document_block
-    : header_spec '{' text_body '}'
+item
+    : document
+    | raw_line
+    | error '\n'
       {
-          emit_sql_record(g_doc_id, g_lang, g_category, &g_text_buf);
-          buf_reset(&g_text_buf);
-          strncpy(g_doc_id, g_default_doc_id, sizeof(g_doc_id) - 1);
-          strncpy(g_lang, g_default_lang, sizeof(g_lang) - 1);
-          strncpy(g_category, g_default_category, sizeof(g_category) - 1);
+          yyerrok;
       }
     ;
 
-header_spec
-    : TOK_DOCUMENT
-    | TOK_DOCUMENT '(' attr_list ')'
+document
+    : TOK_DOCUMENT doc_header '{' doc_body '}'
+      {
+          emit_sql_record(g_doc_id, g_lang, g_category, $4);
+          free($4);
+          reset_doc_attrs();
+      }
+    ;
+
+doc_header
+    : /* empty */
+    | '(' attr_list ')'
     ;
 
 attr_list
-    : /* empty */
-    | attr_list_nonempty
+    : attr
+    | attr_list ',' attr
     ;
 
-attr_list_nonempty
-    : attr_item
-    | attr_list_nonempty ',' attr_item
-    ;
-
-attr_item
-    : TOK_ID_KEY ':' STRING_LITERAL
+attr
+    : TOK_ID ':' TOK_STRING_LITERAL
       {
-          strncpy(g_doc_id, $3, sizeof(g_doc_id) - 1);
-          g_doc_id[sizeof(g_doc_id) - 1] = '\0';
+          sanitize_string_copy(g_doc_id, $3, sizeof(g_doc_id));
           free($3);
       }
-    | TOK_LANG_KEY ':' STRING_LITERAL
+    | TOK_LANG ':' TOK_STRING_LITERAL
       {
-          strncpy(g_lang, $3, sizeof(g_lang) - 1);
-          g_lang[sizeof(g_lang) - 1] = '\0';
+          sanitize_string_copy(g_lang, $3, sizeof(g_lang));
           free($3);
       }
-    | TOK_CAT_KEY ':' STRING_LITERAL
+    | TOK_CATEGORY ':' TOK_STRING_LITERAL
       {
-          strncpy(g_category, $3, sizeof(g_category) - 1);
-          g_category[sizeof(g_category) - 1] = '\0';
+          sanitize_string_copy(g_category, $3, sizeof(g_category));
           free($3);
       }
     ;
 
-text_body
-    : /* empty */
+doc_body
+    : TOK_RAW_TEXT
+      {
+          $$ = $1;
+      }
     ;
 
-plain_stream_line
-    : RAW_LINE
+raw_line
+    : TOK_RAW_LINE
       {
-          buf_reset(&g_text_buf);
-          buf_append_escaped_sql(&g_text_buf, $1, strlen($1));
-          emit_sql_record(g_doc_id, g_lang, g_category, &g_text_buf);
-          buf_reset(&g_text_buf);
+          emit_sql_record(g_doc_id, g_lang, g_category, $1);
           free($1);
       }
     ;
@@ -257,12 +303,33 @@ plain_stream_line
 %%
 
 void yyerror(const char *s) {
-    fprintf(stderr, "[-] Parse warning: %s\n", s);
+    (void)s;
 }
 
-/* =========================================================================
-   Flex 非依存・ハイブリッド字句解析器（DSL & プレーンストリーム対応）
-   ========================================================================= */
+static void print_help(const char *prog) {
+    fprintf(stderr, "Usage: %s [options] < input_text\n\n", prog);
+    fprintf(stderr, "Ultra-fast zero-ORM injection-safe text-to-SQLite stream filter.\n\n");
+    fprintf(stderr, "General Options:\n");
+    fprintf(stderr, "  -t, --table <name>          Destination table name (default: raw_corpus)\n");
+    fprintf(stderr, "  -i, --doc_id <id>           Default doc_id for piped plain lines (default: anon_doc)\n");
+    fprintf(stderr, "  -c, --category <name>       Default category attribute (default: general)\n");
+    fprintf(stderr, "  -l, --lang <code>           Default lang attribute (default: ja)\n");
+    fprintf(stderr, "  -b, --batch <size>          Batch transaction size (default: 1000)\n");
+    fprintf(stderr, "  -w, --whole                 Ingest whole stdin stream as single record\n");
+    fprintf(stderr, "  -h, --help                  Show this help message\n\n");
+    fprintf(stderr, "Column Customization Options:\n");
+    fprintf(stderr, "  --col-doc_id <name>         Rename doc_id column (default: doc_id)\n");
+    fprintf(stderr, "  --col-lang <name>           Rename lang column (default: lang)\n");
+    fprintf(stderr, "  --col-category <name>       Rename category column (default: category)\n");
+    fprintf(stderr, "  --col-raw_text <name>       Rename raw_text column (default: raw_text)\n");
+    fprintf(stderr, "  --col-created_at <name>     Rename created_at column (default: created_at)\n\n");
+    fprintf(stderr, "Column Omission Flags:\n");
+    fprintf(stderr, "  --no-doc_id                 Omit doc_id column from table and insert\n");
+    fprintf(stderr, "  --no-lang                   Omit lang column from table and insert\n");
+    fprintf(stderr, "  --no-category               Omit category column from table and insert\n");
+    fprintf(stderr, "  --no-raw_text               Omit raw_text column from table and insert\n");
+    fprintf(stderr, "  --no-created_at             Omit created_at column from table and insert\n");
+}
 
 typedef enum {
     LEX_TOP,
@@ -271,321 +338,312 @@ typedef enum {
 } LexState;
 
 static LexState g_lex_state = LEX_TOP;
-static int g_brace_depth = 0;
-
-static void skip_header_whitespace(void) {
-    int c;
-    while ((c = getchar()) != EOF) {
-        if (!isspace(c)) {
-            ungetc(c, stdin);
-            break;
-        }
-    }
-}
+static StringBuffer line_buf = {NULL, 0, 0};
 
 int yylex(void) {
-    int c;
-
-    /* Whole モード（標準入力全体を 1 つのレコードとして吸収） */
-    if (g_whole_mode) {
-        static bool s_done = false;
-        if (s_done) return 0;
-        s_done = true;
-
-        buf_reset(&g_text_buf);
-        char tmp[4096];
-        size_t n;
-        while ((n = fread(tmp, 1, sizeof(tmp), stdin)) > 0) {
-            buf_append_escaped_sql(&g_text_buf, tmp, n);
-        }
-        if (g_text_buf.len > 0) {
-            emit_sql_record(g_doc_id, g_lang, g_category, &g_text_buf);
-        }
-        return 0;
+    if (line_buf.cap == 0) {
+        buf_init(&line_buf);
     }
 
-    if (g_lex_state == LEX_HEADER) {
-        skip_header_whitespace();
-        c = getchar();
-        if (c == EOF) return 0;
+    while (1) {
+        if (g_lex_state == LEX_TOP) {
+            line_buf.len = 0;
+            if (line_buf.data) line_buf.data[0] = '\0';
 
-        if (c == '(' || c == ')' || c == ':' || c == ',') {
+            int c;
+            while ((c = getchar()) != EOF) {
+                buf_append_char(&line_buf, (char)c);
+                if (c == '\n') break;
+            }
+
+            if (line_buf.len == 0 && c == EOF) {
+                buf_free(&line_buf);
+                return 0; // EOF
+            }
+
+            // Check if line is purely whitespace
+            bool all_ws = true;
+            for (size_t i = 0; i < line_buf.len; i++) {
+                if (!isspace((unsigned char)line_buf.data[i])) {
+                    all_ws = false;
+                    break;
+                }
+            }
+            if (all_ws) {
+                continue; // Skip blank lines between documents
+            }
+
+            // Check if line starts a Document(...) or Document{ block
+            char *p = line_buf.data;
+            while (*p && isspace((unsigned char)*p)) p++;
+
+            if (strncmp(p, "Document", 8) == 0 && (p[8] == '(' || p[8] == '{' || isspace((unsigned char)p[8]))) {
+                p += 8;
+                while (*p && isspace((unsigned char)*p)) p++;
+
+                // Put back the rest of the line so header parsing can read it
+                for (int i = (int)strlen(line_buf.data) - 1; i >= (int)(p - line_buf.data); i--) {
+                    ungetc(line_buf.data[i], stdin);
+                }
+
+                g_lex_state = LEX_HEADER;
+                return TOK_DOCUMENT;
+            }
+
+            // Strip trailing newlines for raw line insertion
+            if (line_buf.len > 0 && line_buf.data[line_buf.len - 1] == '\n') {
+                line_buf.data[--line_buf.len] = '\0';
+            }
+            if (line_buf.len > 0 && line_buf.data[line_buf.len - 1] == '\r') {
+                line_buf.data[--line_buf.len] = '\0';
+            }
+
+            yylval.str = strdup(line_buf.data ? line_buf.data : "");
+            return TOK_RAW_LINE;
+        }
+
+        if (g_lex_state == LEX_HEADER) {
+            int c;
+            while ((c = getchar()) != EOF && isspace(c)) {
+                // skip whitespace
+            }
+            if (c == EOF) return 0;
+
+            if (c == '(' || c == ')' || c == ',' || c == ':') {
+                return c;
+            }
+
+            if (c == '{') {
+                g_lex_state = LEX_BODY;
+                g_text_buf.len = 0;
+                if (g_text_buf.data) g_text_buf.data[0] = '\0';
+                return '{';
+            }
+
+            if (c == '}') {
+                g_lex_state = LEX_TOP;
+                return '}';
+            }
+
+            if (c == '"') {
+                StringBuffer val;
+                buf_init(&val);
+                while ((c = getchar()) != EOF && c != '"') {
+                    if (c == '\\') {
+                        int nc = getchar();
+                        if (nc != EOF) {
+                            c = nc;
+                        } else {
+                            break;
+                        }
+                    }
+                    buf_append_char(&val, (char)c);
+                }
+                buf_append_char(&val, '\0');
+                yylval.str = strdup(val.data ? val.data : "");
+                buf_free(&val);
+                return TOK_STRING_LITERAL;
+            }
+
+            if (isalpha(c) || c == '_') {
+                StringBuffer id;
+                buf_init(&id);
+                buf_append_char(&id, (char)c);
+                while ((c = getchar()) != EOF && (isalnum(c) || c == '_' || c == '-')) {
+                    buf_append_char(&id, (char)c);
+                }
+                if (c != EOF) ungetc(c, stdin);
+                buf_append_char(&id, '\0');
+
+                if (strcmp(id.data, "id") == 0 || strcmp(id.data, "doc_id") == 0) {
+                    buf_free(&id);
+                    return TOK_ID;
+                }
+                if (strcmp(id.data, "lang") == 0) {
+                    buf_free(&id);
+                    return TOK_LANG;
+                }
+                if (strcmp(id.data, "category") == 0) {
+                    buf_free(&id);
+                    return TOK_CATEGORY;
+                }
+
+                yylval.str = strdup(id.data ? id.data : "");
+                buf_free(&id);
+                return TOK_RAW_TEXT;
+            }
+
             return c;
         }
-        if (c == '{') {
-            g_brace_depth = 1;
-            g_lex_state = LEX_BODY;
-            buf_reset(&g_text_buf);
-            return '{';
-        }
 
-        if (c == '"') {
-            StringBuffer sb;
-            buf_init(&sb);
-            int sc;
-            while ((sc = getchar()) != EOF && sc != '"') {
-                if (sc == '\\') {
-                    int esc = getchar();
-                    if (esc == EOF) break;
-                    if (esc == 'n') esc = '\n';
-                    else if (esc == 't') esc = '\t';
-                    buf_ensure(&sb, 1);
-                    sb.data[sb.len++] = esc;
-                } else {
-                    buf_ensure(&sb, 1);
-                    sb.data[sb.len++] = sc;
+        if (g_lex_state == LEX_BODY) {
+            int c;
+            while ((c = getchar()) != EOF) {
+                if (c == '\\') {
+                    int next_c = getchar();
+                    if (next_c == '}') {
+                        buf_append_char(&g_text_buf, '}');
+                        continue;
+                    } else if (next_c != EOF) {
+                        buf_append_char(&g_text_buf, '\\');
+                        buf_append_char(&g_text_buf, (char)next_c);
+                        continue;
+                    }
                 }
-            }
-            sb.data[sb.len] = '\0';
-            yylval.str = sb.data;
-            return STRING_LITERAL;
-        }
-
-        if (isalpha(c) || c == '_') {
-            char kw[64];
-            size_t idx = 0;
-            kw[idx++] = (char)c;
-            while ((c = getchar()) != EOF && (isalnum(c) || c == '_')) {
-                if (idx < sizeof(kw) - 1) kw[idx++] = (char)c;
-            }
-            if (c != EOF) ungetc(c, stdin);
-            kw[idx] = '\0';
-
-            if (strcmp(kw, "id") == 0) return TOK_ID_KEY;
-            if (strcmp(kw, "lang") == 0) return TOK_LANG_KEY;
-            if (strcmp(kw, "category") == 0) return TOK_CAT_KEY;
-        }
-        return c;
-    }
-
-    if (g_lex_state == LEX_BODY) {
-        while ((c = getchar()) != EOF) {
-            if (c == '{') {
-                g_brace_depth++;
-                buf_append_escaped_sql(&g_text_buf, "{", 1);
-            } else if (c == '}') {
-                g_brace_depth--;
-                if (g_brace_depth == 0) {
-                    g_lex_state = LEX_TOP;
-                    return '}';
+                if (c == '}') {
+                    // Put back '}' so LEX_HEADER will emit it next to reduce the document
+                    ungetc('}', stdin);
+                    g_lex_state = LEX_HEADER;
+                    if (g_text_buf.len == 0) {
+                        buf_append_char(&g_text_buf, '\0');
+                    }
+                    yylval.str = strdup(g_text_buf.data ? g_text_buf.data : "");
+                    return TOK_RAW_TEXT;
                 }
-                buf_append_escaped_sql(&g_text_buf, "}", 1);
-            } else {
-                char ch = (char)c;
-                buf_append_escaped_sql(&g_text_buf, &ch, 1);
+                buf_append_char(&g_text_buf, (char)c);
             }
-        }
-        g_lex_state = LEX_TOP;
-        return 0;
-    }
 
-    /* LEX_TOP: 1行単位で読み込み、Document構文か生テキストかを判定 */
-    while (1) {
-        char line_buf[8192];
-        size_t line_len = 0;
-        while ((c = getchar()) != EOF) {
-            line_buf[line_len++] = (char)c;
-            if (c == '\n' || line_len >= sizeof(line_buf) - 1) {
-                break;
+            g_lex_state = LEX_TOP;
+            if (g_text_buf.len == 0) {
+                buf_append_char(&g_text_buf, '\0');
             }
+            yylval.str = strdup(g_text_buf.data ? g_text_buf.data : "");
+            return TOK_RAW_TEXT;
         }
-        if (line_len == 0 && c == EOF) {
-            return 0;
-        }
-        line_buf[line_len] = '\0';
-
-        /* 先頭の空白スキップ */
-        size_t p = 0;
-        while (p < line_len && (line_buf[p] == ' ' || line_buf[p] == '\t' || line_buf[p] == '\r')) {
-            p++;
-        }
-
-        /* 改行のみ・空白のみの空行はスキップ（余計な空レコード生成を防止） */
-        if (p >= line_len || line_buf[p] == '\n') {
-            continue;
-        }
-
-        if (strncmp(line_buf + p, "Document", 8) == 0 &&
-            (line_buf[p + 8] == '(' || line_buf[p + 8] == '{' || isspace((unsigned char)line_buf[p + 8]))) {
-            for (ssize_t i = (ssize_t)line_len - 1; i >= (ssize_t)p + 8; i--) {
-                ungetc(line_buf[i], stdin);
-            }
-            g_lex_state = LEX_HEADER;
-            return TOK_DOCUMENT;
-        }
-
-        /* 通常の生テキスト行 */
-        while (line_len > 0 && (line_buf[line_len - 1] == '\n' || line_buf[line_len - 1] == '\r')) {
-            line_buf[--line_len] = '\0';
-        }
-        yylval.str = strdup(line_buf);
-        return RAW_LINE;
     }
 }
-
-/* CLI ヘルプ表示 */
-static void print_help(const char *prog) {
-    fprintf(stderr, "Usage: %s [OPTIONS] < input.txt\n", prog);
-    fprintf(stderr, "General Options:\n");
-    fprintf(stderr, "  -t, --table <name>          Target SQLite table name (default: raw_corpus)\n");
-    fprintf(stderr, "  -c, --category <cat>        Default category (default: general)\n");
-    fprintf(stderr, "  -l, --lang <lang>           Default language (default: ja)\n");
-    fprintf(stderr, "  -w, --whole                 Treat entire input as a single document\n");
-    fprintf(stderr, "  -b, --batch <size>          Transaction batch size (default: 1000)\n");
-    fprintf(stderr, "  -h, --help                  Show this help message\n\n");
-    fprintf(stderr, "Column Name Customization:\n");
-    fprintf(stderr, "  --col-doc_id <name>         Rename doc_id column (default: doc_id)\n");
-    fprintf(stderr, "  --col-lang <name>           Rename lang column (default: lang)\n");
-    fprintf(stderr, "  --col-category <name>       Rename category column (default: category)\n");
-    fprintf(stderr, "  --col-raw_text <name>       Rename raw_text column (default: raw_text)\n");
-    fprintf(stderr, "  --col-created_at <name>     Rename created_at column (default: created_at)\n\n");
-    fprintf(stderr, "Column Omission Flags:\n");
-    fprintf(stderr, "  --no-doc_id                 Omit doc_id column from SQL output\n");
-    fprintf(stderr, "  --no-lang                   Omit lang column from SQL output\n");
-    fprintf(stderr, "  --no-category               Omit category column from SQL output\n");
-    fprintf(stderr, "  --no-raw_text               Omit raw_text column from SQL output\n");
-    fprintf(stderr, "  --no-created_at             Omit created_at column from SQL output\n");
-}
-
-enum {
-    OPT_COL_DOC_ID = 1001,
-    OPT_COL_LANG,
-    OPT_COL_CATEGORY,
-    OPT_COL_RAW_TEXT,
-    OPT_COL_CREATED_AT,
-    OPT_NO_DOC_ID,
-    OPT_NO_LANG,
-    OPT_NO_CATEGORY,
-    OPT_NO_RAW_TEXT,
-    OPT_NO_CREATED_AT
-};
 
 int main(int argc, char **argv) {
+    buf_init(&g_text_buf);
+
     static struct option long_options[] = {
-        {"table",          required_argument, 0, 't'},
-        {"category",       required_argument, 0, 'c'},
-        {"lang",           required_argument, 0, 'l'},
-        {"whole",          no_argument,       0, 'w'},
-        {"batch",          required_argument, 0, 'b'},
-        {"help",           no_argument,       0, 'h'},
-        /* カラム名カスタマイズ（アンダースコア／ハイフン両対応） */
-        {"col-doc_id",     required_argument, 0, OPT_COL_DOC_ID},
-        {"col-doc-id",     required_argument, 0, OPT_COL_DOC_ID},
-        {"col-lang",       required_argument, 0, OPT_COL_LANG},
-        {"col-category",   required_argument, 0, OPT_COL_CATEGORY},
-        {"col-raw_text",   required_argument, 0, OPT_COL_RAW_TEXT},
-        {"col-raw-text",   required_argument, 0, OPT_COL_RAW_TEXT},
-        {"col-created_at", required_argument, 0, OPT_COL_CREATED_AT},
-        {"col-created-at", required_argument, 0, OPT_COL_CREATED_AT},
-        /* カラム省略フラグ（アンダースコア／ハイフン両対応） */
-        {"no-doc_id",      no_argument,       0, OPT_NO_DOC_ID},
-        {"no-doc-id",      no_argument,       0, OPT_NO_DOC_ID},
-        {"no-lang",        no_argument,       0, OPT_NO_LANG},
-        {"no-category",    no_argument,       0, OPT_NO_CATEGORY},
-        {"no-raw_text",    no_argument,       0, OPT_NO_RAW_TEXT},
-        {"no-raw-text",    no_argument,       0, OPT_NO_RAW_TEXT},
-        {"no-created_at",  no_argument,       0, OPT_NO_CREATED_AT},
-        {"no-created-at",  no_argument,       0, OPT_NO_CREATED_AT},
+        {"table",           required_argument, 0, 't'},
+        {"doc_id",          required_argument, 0, 'i'},
+        {"doc-id",          required_argument, 0, 'i'},
+        {"id",              required_argument, 0, 'i'},
+        {"category",        required_argument, 0, 'c'},
+        {"lang",            required_argument, 0, 'l'},
+        {"batch",           required_argument, 0, 'b'},
+        {"whole",           no_argument,       0, 'w'},
+        {"help",            no_argument,       0, 'h'},
+        // Column custom naming
+        {"col-doc_id",      required_argument, 0, 1001},
+        {"col-doc-id",      required_argument, 0, 1001},
+        {"col-lang",        required_argument, 0, 1002},
+        {"col-category",    required_argument, 0, 1003},
+        {"col-raw_text",    required_argument, 0, 1004},
+        {"col-raw-text",    required_argument, 0, 1004},
+        {"col-created_at",  required_argument, 0, 1005},
+        {"col-created-at",  required_argument, 0, 1005},
+        // Column omission
+        {"no-doc_id",       no_argument,       0, 1010},
+        {"no-doc-id",       no_argument,       0, 1010},
+        {"no-lang",         no_argument,       0, 1011},
+        {"no-category",     no_argument,       0, 1012},
+        {"no-raw_text",     no_argument,       0, 1013},
+        {"no-raw-text",     no_argument,       0, 1013},
+        {"no-created_at",   no_argument,       0, 1014},
+        {"no-created-at",   no_argument,       0, 1014},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "t:c:l:wb:h", long_options, NULL)) != -1) {
+    int option_index = 0;
+    while ((opt = getopt_long(argc, argv, "t:i:c:l:b:wh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't':
-                strncpy(g_table_name, optarg, sizeof(g_table_name) - 1);
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_table_name, optarg, sizeof(g_table_name) - 1);
+                    g_table_name[sizeof(g_table_name) - 1] = '\0';
+                } else {
+                    fprintf(stderr, "Error: Invalid table identifier '%s'\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'i':
+                sanitize_string_copy(g_default_doc_id, optarg, sizeof(g_default_doc_id));
+                sanitize_string_copy(g_doc_id, optarg, sizeof(g_doc_id));
                 break;
             case 'c':
-                strncpy(g_category, optarg, sizeof(g_category) - 1);
-                strncpy(g_default_category, optarg, sizeof(g_default_category) - 1);
+                sanitize_string_copy(g_default_category, optarg, sizeof(g_default_category));
+                sanitize_string_copy(g_category, optarg, sizeof(g_category));
                 break;
             case 'l':
-                strncpy(g_lang, optarg, sizeof(g_lang) - 1);
-                strncpy(g_default_lang, optarg, sizeof(g_default_lang) - 1);
-                break;
-            case 'w':
-                g_whole_mode = true;
+                sanitize_string_copy(g_default_lang, optarg, sizeof(g_default_lang));
+                sanitize_string_copy(g_lang, optarg, sizeof(g_lang));
                 break;
             case 'b':
                 g_batch_size = atol(optarg);
                 if (g_batch_size <= 0) g_batch_size = 1000;
                 break;
+            case 'w':
+                g_whole_mode = true;
+                break;
+            case 1001:
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_col_doc_id, optarg, sizeof(g_col_doc_id) - 1);
+                    g_col_doc_id[sizeof(g_col_doc_id) - 1] = '\0';
+                }
+                break;
+            case 1002:
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_col_lang, optarg, sizeof(g_col_lang) - 1);
+                    g_col_lang[sizeof(g_col_lang) - 1] = '\0';
+                }
+                break;
+            case 1003:
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_col_category, optarg, sizeof(g_col_category) - 1);
+                    g_col_category[sizeof(g_col_category) - 1] = '\0';
+                }
+                break;
+            case 1004:
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_col_raw_text, optarg, sizeof(g_col_raw_text) - 1);
+                    g_col_raw_text[sizeof(g_col_raw_text) - 1] = '\0';
+                }
+                break;
+            case 1005:
+                if (is_valid_ident(optarg)) {
+                    strncpy(g_col_created_at, optarg, sizeof(g_col_created_at) - 1);
+                    g_col_created_at[sizeof(g_col_created_at) - 1] = '\0';
+                }
+                break;
+            case 1010: g_has_doc_id = false; break;
+            case 1011: g_has_lang = false; break;
+            case 1012: g_has_category = false; break;
+            case 1013: g_has_raw_text = false; break;
+            case 1014: g_has_created_at = false; break;
             case 'h':
                 print_help(argv[0]);
                 return 0;
-            case OPT_COL_DOC_ID:
-                strncpy(g_col_doc_id, optarg, sizeof(g_col_doc_id) - 1);
-                break;
-            case OPT_COL_LANG:
-                strncpy(g_col_lang, optarg, sizeof(g_col_lang) - 1);
-                break;
-            case OPT_COL_CATEGORY:
-                strncpy(g_col_category, optarg, sizeof(g_col_category) - 1);
-                break;
-            case OPT_COL_RAW_TEXT:
-                strncpy(g_col_raw_text, optarg, sizeof(g_col_raw_text) - 1);
-                break;
-            case OPT_COL_CREATED_AT:
-                strncpy(g_col_created_at, optarg, sizeof(g_col_created_at) - 1);
-                break;
-            case OPT_NO_DOC_ID:
-                g_has_doc_id = false;
-                break;
-            case OPT_NO_LANG:
-                g_has_lang = false;
-                break;
-            case OPT_NO_CATEGORY:
-                g_has_category = false;
-                break;
-            case OPT_NO_RAW_TEXT:
-                g_has_raw_text = false;
-                break;
-            case OPT_NO_CREATED_AT:
-                g_has_created_at = false;
-                break;
             default:
                 print_help(argv[0]);
                 return 1;
         }
     }
 
-    buf_init(&g_text_buf);
+    emit_schema_header();
 
-    /* 初期 DDL の動的出力（有効なカラムのみを生成） */
-    printf("-- Auto-generated by UBS sql_filter (Injection-Safe Pipeline)\n");
-    printf("PRAGMA journal_mode = WAL;\n");
-    printf("PRAGMA synchronous = NORMAL;\n");
-    printf("CREATE TABLE IF NOT EXISTS %s (\n", g_table_name);
-    printf("    id INTEGER PRIMARY KEY AUTOINCREMENT");
-    if (g_has_doc_id) {
-        printf(",\n    %s TEXT", g_col_doc_id);
+    if (g_whole_mode) {
+        int c;
+        while ((c = getchar()) != EOF) {
+            buf_append_char(&g_text_buf, (char)c);
+        }
+        if (g_text_buf.len > 0) {
+            emit_sql_record(g_doc_id, g_lang, g_category, g_text_buf.data);
+        }
+    } else {
+        yyparse();
     }
-    if (g_has_lang) {
-        printf(",\n    %s TEXT", g_col_lang);
-    }
-    if (g_has_category) {
-        printf(",\n    %s TEXT", g_col_category);
-    }
-    if (g_has_raw_text) {
-        printf(",\n    %s TEXT", g_col_raw_text);
-    }
-    if (g_has_created_at) {
-        printf(",\n    %s DATETIME", g_col_created_at);
-    }
-    printf("\n);\n");
 
-    /* パース実行 */
-    yyparse();
-
-    if (g_insert_count > 0 && g_insert_count % g_batch_size != 0) {
+    if (g_insert_count % g_batch_size != 0) {
         printf("COMMIT;\n");
     }
 
     fprintf(stderr, "[*] Successfully processed %ld document(s) into SQL stream.\n", g_insert_count);
 
-    if (g_text_buf.data) {
-        free(g_text_buf.data);
-    }
-
+    buf_free(&g_text_buf);
+    buf_free(&line_buf);
     return 0;
 }
