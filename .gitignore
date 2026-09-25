@@ -4,3 +4,5 @@ bin/
 *.sqlite3
 *.log
 .DS_Store
+src/sql_filter.c
+src/sql_filter.h
